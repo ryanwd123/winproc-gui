@@ -773,7 +773,8 @@ impl Pdh {
             let disk_idle = add(w!("\\PhysicalDisk(_Total)\\% Idle Time")).unwrap_or_default();
             let disk_read = add(w!("\\PhysicalDisk(_Total)\\Disk Read Bytes/sec")).unwrap_or_default();
             let disk_write = add(w!("\\PhysicalDisk(_Total)\\Disk Write Bytes/sec")).unwrap_or_default();
-            let _ = PdhCollectQueryData(query);
+            // No collection here: `collect` runs right after, and two collections
+            // back to back gave a near-zero interval (disk 100% for one sample).
             Some(Pdh { query, disk_idle, disk_read, disk_write, gpu: None, buf: Vec::new() })
         }
     }
