@@ -12,7 +12,7 @@ Machine: Intel i7-13700K (24 logical), 64 GB RAM, RTX 3090 + UHD 770, Windows 11
 
 | Version | Date | Commit | Binary size | Startup (median, min–max) | Idle CPU, GPU on | Idle CPU, GPU off | Private | Working set | Threads | Handles | Sample |
 |---------|------|--------|-------------|---------------------------|------------------|-------------------|---------|-------------|---------|---------|--------|
-| 0.1.0 | 2026-11-15 | initial | 412,672 B (403 KiB) | 57.9 ms (47.4–119.6) | 141 ms / 20 s (0.70%) | 0 ms / 20 s (0.00%) | 39.1 MB | 48.4 MB | 41 | 300 | 5–10 ms |
+| 0.1.0 | 2026-11-15 | `2464124` | 412,672 B (403 KiB) | 57.9 ms (47.4–119.6) | 141 ms / 20 s (0.70%) | 0 ms / 20 s (0.00%) | 39.1 MB | 48.4 MB | 41 | 300 | 5–10 ms |
 
 Notes:
 - 0.1.0: almost all idle CPU comes from the PDH `GPU Engine(*)` counter, which has about 1,000 instances. PDH also starts its own threads (41 threads with GPU on, about 20 with it off). Reading GPU usage through D3DKMT directly, like System Informer does, is the obvious next step if this matters.
