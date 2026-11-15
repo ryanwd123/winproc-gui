@@ -53,6 +53,7 @@ pub enum Action {
     ToggleGpu,
     ToggleHeat,
     ToggleCompact,
+    TempUnit,
     RestartAdmin,
     WriteKeymap,
     WriteSettings,
@@ -100,7 +101,7 @@ pub fn bindings() -> Vec<Binding> {
     let g = "Moving around";
     add(g, "focus_search", "Focus the watch search box", FocusSearch, "Ctrl+F, Ctrl+L, /");
     add(g, "clear_search", "Clear the watch search", ClearSearch, "");
-    add(g, "next_view", "Next view (main / watch only)", NextView, "Ctrl+Tab");
+    add(g, "next_view", "Next view (main / watch only / temperatures)", NextView, "Ctrl+Tab");
     add(g, "prev_view", "Previous view", PrevView, "Ctrl+Shift+Tab");
     add(g, "next_pane", "Next area", NextPane, "Tab");
     add(g, "prev_pane", "Previous area", PrevPane, "Shift+Tab");
@@ -138,6 +139,7 @@ pub fn bindings() -> Vec<Binding> {
     add(g, "toggle_gpu", "Toggle GPU sampling", ToggleGpu, "");
     add(g, "toggle_heat", "Toggle CPU / GPU bars", ToggleHeat, "");
     add(g, "toggle_compact", "Toggle compact summary (text only, no graphs)", ToggleCompact, "Alt+S");
+    add(g, "temp_unit", "Toggle temperatures in °C / °F", TempUnit, "");
 
     let g = "Sorting";
     let sort_keys: HashMap<Col, String> = columns::DEFAULT

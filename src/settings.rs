@@ -43,6 +43,7 @@ pub struct Settings {
     pub compact_summary: bool,
     pub hardware_rendering: bool,
     pub history: usize,
+    pub fahrenheit: bool,
 }
 
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
@@ -66,6 +67,7 @@ impl Default for Settings {
             compact_summary: false,
             hardware_rendering: true,
             history: 60,
+            fahrenheit: false,
         }
     }
 }
@@ -118,6 +120,7 @@ impl Settings {
             "show_idle" => self.show_idle = b.unwrap_or(self.show_idle),
             "heat_bars" => self.heat_bars = b.unwrap_or(self.heat_bars),
             "compact_summary" => self.compact_summary = b.unwrap_or(self.compact_summary),
+            "fahrenheit" => self.fahrenheit = b.unwrap_or(self.fahrenheit),
             "hardware_rendering" => self.hardware_rendering = b.unwrap_or(self.hardware_rendering),
             "history" => {
                 if let Ok(n) = v.parse::<usize>() {
@@ -195,7 +198,8 @@ impl Settings {
             "hardware_rendering",
             yn(self.hardware_rendering),
         );
-        put("Samples kept for the summary graphs.", "history", self.history.to_string());
+        put("Samples kept for the summary and temperature graphs.", "history", self.history.to_string());
+        put("Show temperatures in Fahrenheit instead of Celsius.", "fahrenheit", yn(self.fahrenheit));
         s
     }
 }

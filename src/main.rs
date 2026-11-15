@@ -11,6 +11,7 @@ mod render;
 mod sampler;
 mod search;
 mod settings;
+mod temps;
 mod textbox;
 mod theme;
 

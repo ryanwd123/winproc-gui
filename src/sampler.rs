@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::search::{self, Query};
+use crate::temps::{Sensor, Temps};
 
 /// What does not change while a process runs. Shared between snapshots.
 pub struct ProcInfo {
@@ -138,12 +139,15 @@ pub struct Control {
     pub filter: Option<Filter>,
     /// Rescan the rows now without moving the regular sampling schedule.
     pub peek: bool,
+    /// Read only the temperature sensors (the temperatures view); no processes.
+    pub temps: bool,
 }
 
 pub struct Shared {
     pub ctl: Mutex<Control>,
     pub cv: Condvar,
     pub latest: Mutex<Option<Snapshot>>,
+    pub latest_temps: Mutex<Option<Vec<Sensor>>>,
 }
 
 impl Shared {
@@ -166,6 +170,10 @@ impl Shared {
     pub fn take(&self) -> Option<Snapshot> {
         self.latest.lock().unwrap().take()
     }
+
+    pub fn take_temps(&self) -> Option<Vec<Sensor>> {
+        self.latest_temps.lock().unwrap().take()
+    }
 }
 
 /// Starts the sampler thread. Each snapshot posts `msg` to `hwnd`.
@@ -174,6 +182,7 @@ pub fn start(hwnd: HWND, msg: u32, ctl: Control) -> Arc<Shared> {
         ctl: Mutex::new(ctl),
         cv: Condvar::new(),
         latest: Mutex::new(None),
+        latest_temps: Mutex::new(None),
     });
     let s = shared.clone();
     let hwnd = hwnd.0 as isize;
@@ -187,27 +196,44 @@ pub fn start(hwnd: HWND, msg: u32, ctl: Control) -> Arc<Shared> {
 
 fn run(shared: Arc<Shared>, hwnd: isize, msg: u32) {
     let mut sampler = Sampler::new();
+    // Opened the first time the temperatures view is shown.
+    let mut temps: Option<Temps> = None;
     let mut count = 0u32;
     let mut due = Instant::now();
+    let notify = || unsafe {
+        let _ = PostMessageW(Some(HWND(hwnd as _)), msg, WPARAM(0), LPARAM(0));
+    };
     let post = |snap: Snapshot| {
         *shared.latest.lock().unwrap() = Some(snap);
-        unsafe {
-            let _ = PostMessageW(Some(HWND(hwnd as _)), msg, WPARAM(0), LPARAM(0));
-        }
+        notify();
     };
     loop {
-        let (paused, gpu, interval, filter, wake, peek) = {
+        let (paused, gpu, interval, filter, wake, peek, temps_view) = {
             let mut c = shared.ctl.lock().unwrap();
             if c.quit {
                 return;
             }
-            let r = (c.paused, c.gpu, c.interval_ms, c.filter.clone(), c.wake, c.peek);
+            let r = (c.paused, c.gpu, c.interval_ms, c.filter.clone(), c.wake, c.peek, c.temps);
             c.wake = false;
             c.peek = false;
             r
         };
         let now = Instant::now();
-        if !paused {
+        if !paused && temps_view {
+            if wake || now >= due {
+                let first = temps.is_none();
+                let v = temps.get_or_insert_with(Temps::new).read();
+                *shared.latest_temps.lock().unwrap() = Some(v);
+                notify();
+                // The thermal zones are opened on the second read; make it come soon.
+                let wait = if first { 250 } else { interval.max(100) };
+                due = now + Duration::from_millis(wait as u64);
+                // Processes are not sampled meanwhile. Start over as at launch, so
+                // the first rates after switching back are not averages over the gap.
+                sampler.forget_rates();
+                count = 0;
+            }
+        } else if !paused {
             if wake || now >= due {
                 post(sampler.sample(gpu, filter.as_ref()));
                 count += 1;
@@ -343,6 +369,13 @@ impl Sampler {
             last_sys: Sys::default(),
             last_gpu: HashMap::new(),
         }
+    }
+
+    /// Makes the next sample a fresh start with no rates, as the first one is.
+    fn forget_rates(&mut self) {
+        self.last = None;
+        self.cpu_prev.clear();
+        self.net_prev.clear();
     }
 
     fn sample(&mut self, gpu: bool, filter: Option<&Filter>) -> Snapshot {

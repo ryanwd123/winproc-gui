@@ -5,6 +5,7 @@ A fast, keyboard-driven process monitor for Windows. It is meant to start instan
 - **Summary tiles:** CPU (with per-core bars), memory and commit, disk active time and throughput, network send and receive, GPU, and process, thread and handle counts. Each tile has a history graph. Alt+S switches to a compact, text-only summary line.
 - **Watch table:** type `excel | code | python` and only those processes are listed, with a totals row. The search is remembered between runs. Press Ctrl+Shift+K to end everything the watch table lists, for example all of Excel's leftover processes.
 - **All-processes table:** every process, sortable by any column.
+- **Temperatures:** GPU, drive (NVMe and SATA) and ACPI thermal-zone temperatures, with min, max, history, the drive's own warning and critical limits, and GPU fan speed and power. No driver and no administrator rights needed.
 - **Columns:** name, PID, CPU % (per core or whole machine), private bytes, working set, threads, handles, GPU %, I/O read/s and write/s. You can also add parent PID, CPU time, private working set, other I/O, session, priority, age and path.
 - **Customizable:** commands in the palette write `keymap.ini`, `settings.ini` and `theme.ini` out in full and open them in your editor. Save the file and switch back, and the app reloads it.
 - Dark and light themes, and your window size and position are remembered.
@@ -25,6 +26,13 @@ Ctrl+Tab switches views, and the app remembers the last one.
 
 - **Main view:** the summary bar, the watch table and the all-processes table.
 - **Watch view:** only the search box and the watch table, using the whole window. In this view the sampler still reads the kernel's process list (one call returns all of them), but it builds rows and looks up paths only for watched processes. It skips the summary's system-wide reads and the GPU counters, unless the GPU % column is visible.
+- **Temperatures:** a table of temperature sensors. While it is shown, the sampler reads only the sensors: no processes, no CPU, memory, disk, network or GPU counters. Nothing is read while it is not shown, so min, max and the graphs cover the time the view has been open. Sources:
+  - GPUs: `D3DKMTQueryAdapterInfo` (the same data Task Manager shows), with fan speed and power. GPUs that report no temperature (often integrated ones) are left out.
+  - Drives: `IOCTL_STORAGE_QUERY_PROPERTY` with `StorageDeviceTemperatureProperty`, which works for NVMe and most SATA drives without elevation.
+  - ACPI thermal zones: the `Thermal Zone Information` performance counters. These come from the motherboard firmware, and on many desktops they are fixed values.
+  - CPU core temperatures are not shown: Windows only exposes them to kernel drivers.
+
+  The **Toggle temperatures in °C / °F** command (or `fahrenheit = true` in settings.ini) switches units.
 
 ## Watch search
 
@@ -48,7 +56,7 @@ Press F1 in the app for the full list. Ctrl+Shift+P (or Ctrl+K) opens the comman
 | Keys | Action |
 |---|---|
 | Ctrl+F, `/` | focus the watch search |
-| Ctrl+Tab | switch between the main view and the watch view |
+| Ctrl+Tab | next view: main, watch only, temperatures |
 | Tab / Shift+Tab | move between the search box, the watch table and the all-processes table |
 | Up, Down, PgUp, PgDn, Home, End | move the selection |
 | Delete | end the selected process (asks first) |

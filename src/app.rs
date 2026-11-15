@@ -19,6 +19,7 @@ use crate::render::{Align, Font, Gfx, Rect, alpha};
 use crate::sampler::{self, Proc, Shared, Snapshot};
 use crate::search::{self, Query};
 use crate::settings::{self, CpuMode, Settings, SortState, State, ThemeChoice};
+use crate::temps::{Kind, Sensor};
 use crate::textbox::TextBox;
 use crate::theme::{self, Theme};
 
@@ -43,21 +44,25 @@ pub enum View {
     /// Summary and the watch table only. The sampler builds rows for watched
     /// processes only, and the all-processes table is not kept up to date.
     Watch,
+    /// Temperature sensors only. The sampler reads no processes at all.
+    Temps,
 }
 
-const VIEWS: [View; 2] = [View::Main, View::Watch];
+const VIEWS: [View; 3] = [View::Main, View::Watch, View::Temps];
 
 impl View {
     fn key(self) -> &'static str {
         match self {
             View::Main => "main",
             View::Watch => "watch",
+            View::Temps => "temps",
         }
     }
     fn title(self) -> &'static str {
         match self {
             View::Main => "Main view",
             View::Watch => "Watch view",
+            View::Temps => "Temperatures",
         }
     }
 }
@@ -116,6 +121,14 @@ struct History {
     send: VecDeque<f32>,
 }
 
+/// One sensor in the temperatures view, with what was seen since the view opened.
+struct TempRow {
+    sensor: Sensor,
+    min: f32,
+    max: f32,
+    hist: VecDeque<f32>,
+}
+
 fn push(q: &mut VecDeque<f32>, v: f32, cap: usize) {
     q.push_back(v);
     while q.len() > cap {
@@ -135,6 +148,7 @@ struct Layout {
     watch: Rect,
     bar: Rect,
     all: Rect,
+    temps: Rect,
     status: Rect,
     palette: Rect,
 }
@@ -166,6 +180,13 @@ pub struct App {
     sent_filter: Option<sampler::Filter>,
     /// Whether the sampler was last told to read the GPU counters.
     sent_gpu: bool,
+    /// Whether the sampler was last told to read temperatures instead of processes.
+    sent_temps: bool,
+    temps: Vec<TempRow>,
+    /// False until the first reading arrives after the view is opened.
+    temps_read: bool,
+    temps_scroll: usize,
+    temps_visible: usize,
     watch: Table,
     all: Table,
     watch_height: f32,
@@ -245,6 +266,11 @@ impl App {
         let keymap = Keymap::load();
         let theme = theme::load(effective_dark(&settings));
         let gfx = Gfx::new(hwnd, &settings.font, settings.font_size, settings.hardware_rendering, dpi).ok();
+        let view = match state.view.as_str() {
+            "watch" => View::Watch,
+            "temps" => View::Temps,
+            _ => View::Main,
+        };
         let shared = sampler::start(
             hwnd,
             WM_APP_SNAPSHOT,
@@ -256,6 +282,7 @@ impl App {
                 wake: false,
                 filter: None,
                 peek: false,
+                temps: view == View::Temps,
             },
         );
         let search = TextBox::new(&state.search);
@@ -277,9 +304,14 @@ impl App {
             hist_pos: None,
             hist_saved: String::new(),
             focus,
-            view: if state.view == "watch" { View::Watch } else { View::Main },
+            view,
             sent_filter: None,
             sent_gpu: settings.gpu,
+            sent_temps: view == View::Temps,
+            temps: Vec::new(),
+            temps_read: false,
+            temps_scroll: 0,
+            temps_visible: 1,
             watch: Table::new(state.watch_sort.clone()),
             all: Table::new(state.all_sort.clone()),
             watch_height: state.watch_height,
@@ -348,9 +380,18 @@ impl App {
     // ---------------------------------------------------------------- data
 
     pub fn on_snapshot(&mut self) {
+        if let Some(v) = self.shared.take_temps() {
+            self.merge_temps(v);
+            self.invalidate();
+        }
         let Some(snap) = self.shared.take() else { return };
         if snap.filtered && self.view == View::Main {
             // Taken before the switch to the main view; a full one is on its way.
+            return;
+        }
+        if !snap.rates_valid && self.snap.is_some() {
+            // The first sample after the temperatures view has no rates yet; keep
+            // showing the last one until the next sample (250 ms later) has them.
             return;
         }
         let cap = self.settings.history;
@@ -370,6 +411,36 @@ impl App {
         self.snap = Some(snap);
         self.rebuild();
         self.invalidate();
+    }
+
+    fn merge_temps(&mut self, v: Vec<Sensor>) {
+        let cap = self.settings.history;
+        let mut old = std::mem::take(&mut self.temps);
+        for s in v {
+            let mut row = match old.iter().position(|r| r.sensor.kind == s.kind && r.sensor.name == s.name) {
+                Some(i) => old.remove(i),
+                None => TempRow { sensor: s.clone(), min: f32::MAX, max: f32::MIN, hist: VecDeque::new() },
+            };
+            if let Some(c) = s.celsius {
+                row.min = row.min.min(c);
+                row.max = row.max.max(c);
+                push(&mut row.hist, c, cap);
+            }
+            row.sensor = s;
+            self.temps.push(row);
+        }
+        self.temps_read = true;
+        self.clamp_temps_scroll();
+    }
+
+    fn clamp_temps_scroll(&mut self) {
+        self.temps_scroll = self.temps_scroll.min(self.temps.len().saturating_sub(self.temps_visible));
+    }
+
+    /// Rows that PageUp and PageDown move by.
+    fn page(&self) -> usize {
+        let v = if self.view == View::Temps { self.temps_visible } else { self.table(self.active()).visible };
+        v.max(2) - 1
     }
 
     fn cpu_scale(&self) -> f32 {
@@ -456,6 +527,10 @@ impl App {
     }
 
     fn selected(&self) -> Option<&Proc> {
+        // Process commands must never reach a row that is not on screen.
+        if self.view == View::Temps {
+            return None;
+        }
         let w = self.active();
         let t = self.table(w);
         t.sel?;
@@ -486,8 +561,19 @@ impl App {
         let filter = match self.view {
             View::Main => None,
             View::Watch => Some(sampler::Filter { query: self.query.clone(), children: self.settings.watch_children }),
+            // Processes are not sampled at all; keep the filter for coming back.
+            View::Temps => self.sent_filter.clone(),
         };
-        if filter != self.sent_filter {
+        let temps = self.view == View::Temps;
+        if temps != self.sent_temps {
+            // One update, so the sampler never takes a sample with only half of it.
+            self.sent_temps = temps;
+            self.sent_filter = filter.clone();
+            self.shared.update(|c| {
+                c.temps = temps;
+                c.filter = filter;
+            });
+        } else if filter != self.sent_filter {
             let to_main = filter.is_none();
             self.sent_filter = filter.clone();
             if to_main {
@@ -514,6 +600,13 @@ impl App {
         self.view = v;
         if v == View::Watch && self.focus == Focus::All {
             self.focus = if self.query.is_empty() { Focus::Search } else { Focus::Watch };
+        }
+        if v == View::Temps {
+            // Min, max and the graphs cover the time the view is open; nothing
+            // is read while it is not.
+            self.temps.clear();
+            self.temps_read = false;
+            self.temps_scroll = 0;
         }
         self.sync_filter();
         // Until the next sample arrives, show what the last one had.
@@ -692,6 +785,17 @@ impl App {
         let status_h = (s * 1.75).round();
         l.status = Rect::new(0.0, h - status_h, w, status_h);
         let bar_h = (s * 1.7).round();
+        if self.view == View::Temps {
+            l.search = Rect::default();
+            l.temps = Rect::new(pad, pad, inner, (l.status.y - pad * 1.5).max(header_h));
+            let pw = (w - 4.0 * pad).min(s * 50.0);
+            l.palette = Rect::new((w - pw) / 2.0, pad * 3.0, pw, 0.0);
+            let rows_h = l.temps.h - header_h - temps_footer_h(row_h);
+            self.temps_visible = ((rows_h / temps_row_h(row_h)).floor().max(1.0)) as usize;
+            self.layout = l;
+            self.clamp_temps_scroll();
+            return;
+        }
         if self.view == View::Watch {
             let bottom = l.status.y - pad * 0.5;
             if self.query.is_empty() {
@@ -756,6 +860,14 @@ impl App {
             g = self.gfx.take().unwrap();
         }
         if g.begin(self.theme.bg) {
+            if self.view == View::Temps {
+                self.paint_temps(&mut g);
+                self.paint_status(&mut g);
+                self.paint_overlay(&mut g);
+                g.end();
+                self.gfx = Some(g);
+                return;
+            }
             if self.view == View::Main {
                 self.paint_tiles(&mut g);
             }
@@ -774,6 +886,119 @@ impl App {
             g.end();
         }
         self.gfx = Some(g);
+    }
+
+    fn temp_text(&self, c: f32) -> String {
+        if self.settings.fahrenheit { format!("{:.0} °F", c * 1.8 + 32.0) } else { format!("{c:.0} °C") }
+    }
+
+    /// The sensor table of the temperatures view.
+    fn paint_temps(&self, g: &mut Gfx) {
+        let t = &self.theme;
+        let l = &self.layout;
+        let r = l.temps;
+        let s = g.size;
+        let cell_pad = 6.0;
+        let rh = temps_row_h(l.row_h);
+        // (title, width in em, right-aligned); width 0 is the flexible history column.
+        let cols: [(&str, f32, bool); 8] = [
+            ("Sensor", 16.0, false),
+            ("Type", 6.0, false),
+            ("Now", 5.0, true),
+            ("Min", 4.5, true),
+            ("Max", 4.5, true),
+            ("Device limits", 13.0, false),
+            ("History", 0.0, false),
+            ("Details", 13.0, false),
+        ];
+        let fixed: f32 = cols.iter().map(|c| c.1 * s).sum();
+        let flex = (r.w - fixed).max(s * 6.0);
+        let mut xs = Vec::with_capacity(cols.len());
+        let mut x = r.x;
+        for c in &cols {
+            let w = if c.1 == 0.0 { flex } else { c.1 * s };
+            xs.push((x, w));
+            x += w;
+        }
+
+        let hr = Rect::new(r.x, r.y, r.w, l.header_h);
+        g.fill(hr, t.panel);
+        for (i, c) in cols.iter().enumerate() {
+            let (x, w) = xs[i];
+            let cr = Rect::new(x + cell_pad, r.y, w - 2.0 * cell_pad, l.header_h);
+            g.text(c.0, cr, Font::Bold, t.text_dim, if c.2 { Align::Right } else { Align::Left });
+            if i > 0 {
+                g.vline(x, r.y + 5.0, r.y + l.header_h - 5.0, t.border);
+            }
+        }
+        g.hline(r.x, r.right(), r.y + l.header_h - 1.0, t.border);
+
+        let foot_h = temps_footer_h(l.row_h);
+        let body = Rect::new(r.x, r.y + l.header_h, r.w, r.h - l.header_h - foot_h);
+        if self.temps.is_empty() {
+            let msg = if self.temps_read { "No temperature sensors found" } else { "Reading sensors…" };
+            g.text(msg, Rect::new(body.x, body.y, body.w, rh * 2.0), Font::Small, t.text_dim, Align::Center);
+        }
+        g.clip(body);
+        let cap = self.settings.history;
+        for (i, row) in self.temps.iter().enumerate().skip(self.temps_scroll) {
+            let y = body.y + (i - self.temps_scroll) as f32 * rh;
+            if y > body.bottom() {
+                break;
+            }
+            if i % 2 == 1 {
+                g.fill(Rect::new(r.x, y, r.w, rh), t.row_alt);
+            }
+            let sn = &row.sensor;
+            let cell = |k: usize| Rect::new(xs[k].0 + cell_pad, y, xs[k].1 - 2.0 * cell_pad, rh);
+            g.text(&sn.name, cell(0), Font::Normal, t.text, Align::Left);
+            g.text(sn.kind.title(), cell(1), Font::Small, t.text_dim, Align::Left);
+            let seen = row.min <= row.max;
+            match sn.celsius {
+                Some(c) => {
+                    let hot = sn.crit.is_some_and(|v| c >= v) || sn.warn.is_some_and(|v| c >= v);
+                    let warm = !hot && sn.warn.is_some_and(|v| c >= v - 10.0);
+                    let color = if hot { t.danger } else if warm { t.heat } else { t.text };
+                    g.text(&self.temp_text(c), cell(2), Font::Bold, color, Align::Right);
+                }
+                None => g.text("–", cell(2), Font::Bold, t.text_dim, Align::Right),
+            }
+            if seen {
+                g.text(&self.temp_text(row.min), cell(3), Font::Normal, t.text_dim, Align::Right);
+                g.text(&self.temp_text(row.max), cell(4), Font::Normal, t.text_dim, Align::Right);
+            }
+            let mut limits = Vec::new();
+            if let Some(v) = sn.warn {
+                limits.push(format!("warn {}", self.temp_text(v)));
+            }
+            if let Some(v) = sn.crit {
+                limits.push(format!("crit {}", self.temp_text(v)));
+            }
+            g.text(&limits.join("  ·  "), cell(5), Font::Small, t.text_dim, Align::Left);
+            if !row.hist.is_empty() {
+                // Scaled to what this sensor has shown, at least 10 °C tall, so small
+                // changes are visible without making noise look like a spike.
+                let lo = (row.min - 2.0).floor();
+                let hi = (row.max + 2.0).ceil().max(lo + 10.0);
+                let v: Vec<f32> = row.hist.iter().map(|c| (c - lo) / (hi - lo)).collect();
+                let gr = Rect::new(xs[6].0 + 4.0, y + 3.0, xs[6].1 - 8.0, rh - 6.0);
+                g.area(gr, &v, cap, alpha(t.heat, 0.14), alpha(t.heat, 0.8));
+            }
+            g.text(&sn.detail, cell(7), Font::Small, t.text_dim, Align::Left);
+        }
+        g.unclip();
+
+        let mut notes = vec!["Min, max and history cover the time this view has been open; nothing is read while it is closed."];
+        if self.temps.iter().any(|r| r.sensor.kind == Kind::Zone) {
+            notes.push("ACPI zones come from the motherboard firmware; on many desktops they never change.");
+        }
+        notes.push("CPU core temperatures need a kernel driver, so they are not shown.");
+        let fy = r.bottom() - foot_h;
+        g.hline(r.x, r.right(), fy, t.border);
+        for (i, n) in notes.iter().enumerate() {
+            let nr = Rect::new(r.x + cell_pad, fy + 4.0 + i as f32 * l.row_h * 0.9, r.w - 2.0 * cell_pad, l.row_h * 0.9);
+            g.text(n, nr, Font::Small, t.text_dim, Align::Left);
+        }
     }
 
     /// The text-only summary: one row of label/value cells, no graphs.
@@ -1424,7 +1649,7 @@ impl App {
             Overlay::Palette { .. } => return self.palette_key(k, action),
         }
 
-        if self.focus == Focus::Search {
+        if self.focus == Focus::Search && self.view != View::Temps {
             if self.search_key(k) {
                 return true;
             }
@@ -1541,7 +1766,7 @@ impl App {
                 input.insert(s);
                 self.filter_palette();
             }
-            Overlay::None if self.focus == Focus::Search => {
+            Overlay::None if self.focus == Focus::Search && self.view != View::Temps => {
                 let was_empty = self.query.is_empty();
                 self.hist_pos = None;
                 self.search.insert(s);
@@ -1576,6 +1801,12 @@ impl App {
     }
 
     fn move_sel(&mut self, delta: isize) {
+        if self.view == View::Temps {
+            // No selection here; the keys scroll.
+            self.temps_scroll = (self.temps_scroll as isize).saturating_add(delta).max(0) as usize;
+            self.clamp_temps_scroll();
+            return;
+        }
         let w = self.active();
         let t = self.table(w);
         if t.rows.is_empty() {
@@ -1697,6 +1928,9 @@ impl App {
                 let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             },
             FocusSearch => {
+                if self.view == View::Temps {
+                    self.set_view(View::Main);
+                }
                 self.focus = Focus::Search;
                 self.search.end(false);
             }
@@ -1712,6 +1946,7 @@ impl App {
                 let next = if a == NextView { VIEWS[(i + 1) % n] } else { VIEWS[(i + n - 1) % n] };
                 self.set_view(next);
             }
+            NextPane | PrevPane if self.view == View::Temps => {}
             NextPane | PrevPane => {
                 let order: Vec<Focus> = if self.view == View::Watch {
                     vec![Focus::Search, Focus::Watch]
@@ -1725,7 +1960,12 @@ impl App {
                 let next = if a == NextPane { order[(i + 1) % n] } else { order[(i + n - 1) % n] };
                 self.focus_table(next);
             }
-            FocusWatch => self.focus_table(Focus::Watch),
+            FocusWatch => {
+                if self.view == View::Temps {
+                    self.set_view(View::Main);
+                }
+                self.focus_table(Focus::Watch);
+            }
             FocusAll => {
                 self.set_view(View::Main);
                 self.focus_table(Focus::All);
@@ -1733,11 +1973,11 @@ impl App {
             Up => self.move_sel(-1),
             Down => self.move_sel(1),
             PageUp => {
-                let v = self.table(self.active()).visible.max(2) as isize - 1;
+                let v = self.page() as isize;
                 self.move_sel(-v);
             }
             PageDown => {
-                let v = self.table(self.active()).visible.max(2) as isize - 1;
+                let v = self.page() as isize;
                 self.move_sel(v);
             }
             Top => self.move_sel(-(1 << 30)),
@@ -1754,6 +1994,7 @@ impl App {
                 }
                 None => self.flash("Select a process first", true),
             },
+            KillWatched if self.view == View::Temps => self.flash("Not in the temperatures view", true),
             KillWatched => {
                 let targets: Vec<Target> = match &self.snap {
                     Some(s) => self.watch.rows.iter().map(|&i| Self::target(&s.procs[i])).collect(),
@@ -1871,6 +2112,12 @@ impl App {
                 self.settings.compact_summary = !self.settings.compact_summary;
                 let v = self.settings.compact_summary.to_string();
                 self.save_setting("compact_summary", &v);
+            }
+            TempUnit => {
+                self.settings.fahrenheit = !self.settings.fahrenheit;
+                let v = self.settings.fahrenheit.to_string();
+                self.save_setting("fahrenheit", &v);
+                self.flash(if self.settings.fahrenheit { "Temperatures in °F" } else { "Temperatures in °C" }, false);
             }
             ToggleHeat => {
                 self.settings.heat_bars = !self.settings.heat_bars;
@@ -2222,6 +2469,11 @@ impl App {
             let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
         }
         let (x, y) = self.dip(pt.x, pt.y);
+        if self.view == View::Temps {
+            self.move_sel(-n);
+            self.invalidate();
+            return;
+        }
         let w = match self.row_at(x, y) {
             Some((w, _)) => w,
             None if self.layout.all.y <= y => Which::All,
@@ -2305,6 +2557,15 @@ pub enum Cursor {
 
 fn is_printable(vk: u16) -> bool {
     matches!(vk, 0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2)
+}
+
+fn temps_row_h(row_h: f32) -> f32 {
+    (row_h * 1.5).round()
+}
+
+/// The notes under the sensor table: three short lines.
+fn temps_footer_h(row_h: f32) -> f32 {
+    (row_h * 0.9 * 3.0 + 10.0).round()
 }
 
 fn fmt_ms(ms: u32) -> String {
