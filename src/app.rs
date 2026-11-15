@@ -1,6 +1,6 @@
 //! The window's state, layout, painting, input and commands.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -17,7 +17,7 @@ use crate::keymap::{self, Action, Binding, Key, Keymap};
 use crate::platform::{self, Target};
 use crate::render::{Align, Font, Gfx, Rect, alpha};
 use crate::sampler::{self, Proc, Shared, Snapshot};
-use crate::search::Query;
+use crate::search::{self, Query};
 use crate::settings::{self, CpuMode, Settings, SortState, State, ThemeChoice};
 use crate::textbox::TextBox;
 use crate::theme::{self, Theme};
@@ -33,6 +33,33 @@ pub enum Focus {
     Search,
     Watch,
     All,
+}
+
+/// What the window shows. Ctrl+Tab cycles through them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum View {
+    /// Summary, watch table and all processes.
+    Main,
+    /// Summary and the watch table only. The sampler builds rows for watched
+    /// processes only, and the all-processes table is not kept up to date.
+    Watch,
+}
+
+const VIEWS: [View; 2] = [View::Main, View::Watch];
+
+impl View {
+    fn key(self) -> &'static str {
+        match self {
+            View::Main => "main",
+            View::Watch => "watch",
+        }
+    }
+    fn title(self) -> &'static str {
+        match self {
+            View::Main => "Main view",
+            View::Watch => "Watch view",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,6 +161,11 @@ pub struct App {
     hist_pos: Option<usize>,
     hist_saved: String,
     focus: Focus,
+    view: View,
+    /// The filter last sent to the sampler.
+    sent_filter: Option<sampler::Filter>,
+    /// Whether the sampler was last told to read the GPU counters.
+    sent_gpu: bool,
     watch: Table,
     all: Table,
     watch_height: f32,
@@ -222,6 +254,8 @@ impl App {
                 gpu: settings.gpu,
                 quit: false,
                 wake: false,
+                filter: None,
+                peek: false,
             },
         );
         let search = TextBox::new(&state.search);
@@ -243,6 +277,9 @@ impl App {
             hist_pos: None,
             hist_saved: String::new(),
             focus,
+            view: if state.view == "watch" { View::Watch } else { View::Main },
+            sent_filter: None,
+            sent_gpu: settings.gpu,
             watch: Table::new(state.watch_sort.clone()),
             all: Table::new(state.all_sort.clone()),
             watch_height: state.watch_height,
@@ -261,6 +298,7 @@ impl App {
             settings,
         });
         app.style_window();
+        app.sync_filter();
         if let Some(e) = errors.first() {
             app.flash(e.clone(), true);
         }
@@ -311,16 +349,22 @@ impl App {
 
     pub fn on_snapshot(&mut self) {
         let Some(snap) = self.shared.take() else { return };
+        if snap.filtered && self.view == View::Main {
+            // Taken before the switch to the main view; a full one is on its way.
+            return;
+        }
         let cap = self.settings.history;
         let s = &snap.sys;
-        if snap.rates_valid {
+        // Watch-view samples carry no summary values.
+        let graph = !snap.peek && !snap.filtered;
+        if snap.rates_valid && graph {
             push(&mut self.graphs.cpu, s.cpu / 100.0, cap);
             push(&mut self.graphs.disk, s.disk.as_ref().map(|d| d.active / 100.0).unwrap_or(0.0), cap);
             push(&mut self.graphs.gpu, s.gpu.unwrap_or(0.0) / 100.0, cap);
             push(&mut self.graphs.recv, s.net.recv as f32, cap);
             push(&mut self.graphs.send, s.net.send as f32, cap);
         }
-        if s.mem_total > 0 {
+        if s.mem_total > 0 && graph {
             push(&mut self.graphs.mem, 1.0 - s.mem_avail as f32 / s.mem_total as f32, cap);
         }
         self.snap = Some(snap);
@@ -344,32 +388,16 @@ impl App {
 
         let mut watched: Vec<usize> = Vec::new();
         if !self.query.is_empty() {
-            let mut hit: HashSet<usize> = base
-                .clone()
-                .filter(|&i| self.query.matches(&procs[i].info.name_lower, procs[i].pid))
-                .collect();
-            if self.settings.watch_children && !hit.is_empty() {
-                let by_pid: HashMap<u32, usize> = procs.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
-                for i in base.clone() {
-                    let mut cur = i;
-                    for _ in 0..64 {
-                        let p = &procs[cur];
-                        let Some(&parent) = by_pid.get(&p.ppid) else { break };
-                        // A parent must be older than its child; otherwise the PID was reused.
-                        if parent == cur || procs[parent].create_time > p.create_time {
-                            break;
-                        }
-                        if hit.contains(&parent) {
-                            hit.insert(i);
-                            break;
-                        }
-                        cur = parent;
-                    }
-                }
+            let mut hit: Vec<bool> = procs.iter().map(|p| self.query.matches(&p.info.name_lower, p.pid)).collect();
+            if self.settings.watch_children {
+                let tree: Vec<(u32, u32, u64)> = procs.iter().map(|p| (p.pid, p.ppid, p.create_time)).collect();
+                search::add_children(&tree, &mut hit);
             }
-            watched = hit.into_iter().collect();
+            watched = base.clone().filter(|&i| hit[i]).collect();
         }
-        let all: Vec<usize> = base.collect();
+        // The watch view does not keep the all-processes table up to date.
+        let full = self.view == View::Main;
+        let all: Vec<usize> = if full { base.collect() } else { Vec::new() };
 
         fn sort(rows: &mut [usize], procs: &[Proc], s: &SortState) {
             rows.sort_by(|&a, &b| {
@@ -383,8 +411,12 @@ impl App {
         let mut all = all;
         sort(&mut all, procs, &self.all.sort);
 
-        for (t, rows) in [(&mut self.watch, watched), (&mut self.all, all)] {
+        for (t, rows, live) in [(&mut self.watch, watched, true), (&mut self.all, all, full)] {
             t.rows = rows;
+            // A hidden table keeps its selection for when it is shown again.
+            if !live {
+                continue;
+            }
             if let Some(sel) = t.sel {
                 match t.rows.iter().position(|&i| (procs[i].pid, procs[i].create_time) == sel) {
                     Some(i) => t.sel_idx = i,
@@ -449,8 +481,50 @@ impl App {
         self.search_changed();
     }
 
+    /// Tells the sampler which processes the current view needs rows for.
+    fn sync_filter(&mut self) {
+        let filter = match self.view {
+            View::Main => None,
+            View::Watch => Some(sampler::Filter { query: self.query.clone(), children: self.settings.watch_children }),
+        };
+        if filter != self.sent_filter {
+            let to_main = filter.is_none();
+            self.sent_filter = filter.clone();
+            if to_main {
+                // Watch-view samples skip the summary, so the main view needs a full one now.
+                self.shared.update(|c| c.filter = None);
+            } else {
+                // The sampler rescans right away, so the new rows show up as you type.
+                self.shared.set_filter(filter);
+            }
+        }
+        // GPU counters are the most expensive thing sampled; read them only
+        // when the summary or the GPU column shows them.
+        let gpu = self.settings.gpu && (self.view == View::Main || self.settings.columns.contains(&Col::Gpu));
+        if gpu != self.sent_gpu {
+            self.sent_gpu = gpu;
+            self.shared.update(|c| c.gpu = gpu);
+        }
+    }
+
+    fn set_view(&mut self, v: View) {
+        if v == self.view {
+            return;
+        }
+        self.view = v;
+        if v == View::Watch && self.focus == Focus::All {
+            self.focus = if self.query.is_empty() { Focus::Search } else { Focus::Watch };
+        }
+        self.sync_filter();
+        // Until the next sample arrives, show what the last one had.
+        self.rebuild();
+        self.compute_layout();
+        self.flash(v.title(), false);
+    }
+
     fn search_changed(&mut self) {
         self.query = Query::parse(&self.search.text);
+        self.sync_filter();
         self.watch.scroll = 0;
         self.rebuild();
         self.invalidate();
@@ -486,6 +560,7 @@ impl App {
             watch_sort: self.watch.sort.clone(),
             all_sort: self.all.sort.clone(),
             watch_height: self.watch_height,
+            view: self.view.key().into(),
         }
         .save();
     }
@@ -511,14 +586,12 @@ impl App {
         if old.always_on_top != s.always_on_top {
             platform::set_topmost(self.hwnd, s.always_on_top);
         }
-        if old.refresh_ms != s.refresh_ms || old.gpu != s.gpu {
-            let (ms, gpu) = (s.refresh_ms, s.gpu);
-            self.shared.update(|c| {
-                c.interval_ms = ms;
-                c.gpu = gpu;
-            });
+        if old.refresh_ms != s.refresh_ms {
+            let ms = s.refresh_ms;
+            self.shared.update(|c| c.interval_ms = ms);
         }
         self.update_paused();
+        self.sync_filter();
         self.rebuild();
         self.compute_layout();
         self.invalidate();
@@ -606,14 +679,33 @@ impl App {
         let mut l = Layout { pad, row_h, header_h, sb_w: (s * 0.75).round(), ..Default::default() };
         let inner = w - 2.0 * pad;
         let mut y = pad;
-        let tiles_h = if self.settings.compact_summary { (s * 2.1).round() } else { (s * 5.4).round() };
-        l.tiles = Rect::new(pad, y, inner, tiles_h);
-        y += l.tiles.h + pad;
+        if self.view == View::Main {
+            let tiles_h = if self.settings.compact_summary { (s * 2.1).round() } else { (s * 5.4).round() };
+            l.tiles = Rect::new(pad, y, inner, tiles_h);
+            y += l.tiles.h + pad;
+        } else {
+            // The watch view has no summary bar.
+            l.tiles = Rect::new(pad, y, inner, 0.0);
+        }
         l.search = Rect::new(pad, y, inner, (s * 2.1).round());
         y += l.search.h + pad * 0.5;
         let status_h = (s * 1.75).round();
         l.status = Rect::new(0.0, h - status_h, w, status_h);
         let bar_h = (s * 1.7).round();
+        if self.view == View::Watch {
+            let bottom = l.status.y - pad * 0.5;
+            if self.query.is_empty() {
+                l.hint = Rect::new(pad, y, inner, row_h);
+            } else {
+                l.watch = Rect::new(pad, y, inner, (bottom - y).max(header_h + row_h * 2.0));
+            }
+            self.watch.visible = (((l.watch.h - header_h - row_h) / row_h).floor().max(1.0)) as usize;
+            self.watch.clamp_scroll();
+            let pw = (w - 4.0 * pad).min(s * 50.0);
+            l.palette = Rect::new((w - pw) / 2.0, l.tiles.y + pad * 2.0, pw, 0.0);
+            self.layout = l;
+            return;
+        }
         if self.query.is_empty() {
             l.hint = Rect::new(pad, y, inner, row_h);
             y += row_h;
@@ -664,15 +756,19 @@ impl App {
             g = self.gfx.take().unwrap();
         }
         if g.begin(self.theme.bg) {
-            self.paint_tiles(&mut g);
+            if self.view == View::Main {
+                self.paint_tiles(&mut g);
+            }
             self.paint_search(&mut g);
             if self.query.is_empty() {
                 self.paint_hint(&mut g);
             } else {
                 self.paint_table(&mut g, Which::Watch);
             }
-            self.paint_bar(&mut g);
-            self.paint_table(&mut g, Which::All);
+            if self.view == View::Main {
+                self.paint_bar(&mut g);
+                self.paint_table(&mut g, Which::All);
+            }
             self.paint_status(&mut g);
             self.paint_overlay(&mut g);
             g.end();
@@ -1123,6 +1219,8 @@ impl App {
         if self.user_paused {
             right.push("⏸ Paused".to_string());
         }
+        let views = self.keymap.short_label(Action::NextView);
+        right.push(if views.is_empty() { self.view.title().to_string() } else { format!("{} ({views})", self.view.title()) });
         right.push(format!("every {}", fmt_ms(self.settings.refresh_ms)));
         let pal = self.keymap.short_label(Action::Palette);
         if !pal.is_empty() {
@@ -1141,7 +1239,7 @@ impl App {
             g.text(msg, left_r, Font::Small, if *err { t.danger } else { t.ok }, Align::Left);
         } else if let Some(p) = self.selected() {
             let mut s = format!("{}  ·  PID {}  ·  parent {}", p.info.name, p.pid, p.ppid);
-            if let Some(path) = &p.info.path {
+            if let Some(path) = p.info.path() {
                 s.push_str("  ·  ");
                 s.push_str(path);
             }
@@ -1458,7 +1556,12 @@ impl App {
     }
 
     fn focus_table(&mut self, f: Focus) {
-        let f = if f == Focus::Watch && self.query.is_empty() { Focus::All } else { f };
+        let f = match (self.view, f) {
+            (View::Watch, Focus::All | Focus::Watch) if self.query.is_empty() => Focus::Search,
+            (View::Watch, Focus::All) => Focus::Watch,
+            (View::Main, Focus::Watch) if self.query.is_empty() => Focus::All,
+            _ => f,
+        };
         if self.focus == Focus::Search && f != Focus::Search {
             self.remember_search();
         }
@@ -1603,8 +1706,16 @@ impl App {
                 self.focus = Focus::Search;
                 self.compute_layout();
             }
+            NextView | PrevView => {
+                let i = VIEWS.iter().position(|&v| v == self.view).unwrap_or(0);
+                let n = VIEWS.len();
+                let next = if a == NextView { VIEWS[(i + 1) % n] } else { VIEWS[(i + n - 1) % n] };
+                self.set_view(next);
+            }
             NextPane | PrevPane => {
-                let order: Vec<Focus> = if self.query.is_empty() {
+                let order: Vec<Focus> = if self.view == View::Watch {
+                    vec![Focus::Search, Focus::Watch]
+                } else if self.query.is_empty() {
                     vec![Focus::Search, Focus::All]
                 } else {
                     vec![Focus::Search, Focus::Watch, Focus::All]
@@ -1615,7 +1726,10 @@ impl App {
                 self.focus_table(next);
             }
             FocusWatch => self.focus_table(Focus::Watch),
-            FocusAll => self.focus_table(Focus::All),
+            FocusAll => {
+                self.set_view(View::Main);
+                self.focus_table(Focus::All);
+            }
             Up => self.move_sel(-1),
             Down => self.move_sel(1),
             PageUp => {
@@ -1655,12 +1769,12 @@ impl App {
             AddToWatch => self.add_to_watch(),
             CopyRow => {
                 if let Some(p) = self.selected() {
-                    let s = format!("{}\t{}\t{}", p.info.name, p.pid, p.info.path.as_deref().unwrap_or(""));
+                    let s = format!("{}\t{}\t{}", p.info.name, p.pid, p.info.path().unwrap_or(""));
                     platform::copy_text(self.hwnd, &s);
                     self.flash("Copied name, PID and path", false);
                 }
             }
-            CopyPath => match self.selected().map(|p| p.info.path.clone()) {
+            CopyPath => match self.selected().map(|p| p.info.path().map(str::to_string)) {
                 Some(Some(path)) => {
                     platform::copy_text(self.hwnd, &path);
                     self.flash(format!("Copied {path}"), false);
@@ -1668,7 +1782,7 @@ impl App {
                 Some(None) => self.flash("Windows does not give the path of this process", true),
                 None => {}
             },
-            OpenLocation => match self.selected().map(|p| p.info.path.clone()) {
+            OpenLocation => match self.selected().map(|p| p.info.path().map(str::to_string)) {
                 Some(Some(path)) => platform::reveal(&path),
                 Some(None) => self.flash("Windows does not give the path of this process", true),
                 None => {}
@@ -1683,6 +1797,7 @@ impl App {
                 }
                 let v = crate::columns::list_to_string(&self.settings.columns);
                 self.save_setting("columns", &v);
+                self.sync_filter();
             }
             CpuMode => {
                 self.settings.cpu_mode = match self.settings.cpu_mode {
@@ -1726,6 +1841,7 @@ impl App {
                 self.settings.watch_children = !self.settings.watch_children;
                 let v = self.settings.watch_children.to_string();
                 self.save_setting("watch_children", &v);
+                self.sync_filter();
                 self.rebuild();
                 self.flash(if self.settings.watch_children { "Watching child processes too" } else { "Watching matches only" }, false);
             }
@@ -1747,7 +1863,7 @@ impl App {
             ToggleGpu => {
                 self.settings.gpu = !self.settings.gpu;
                 let gpu = self.settings.gpu;
-                self.shared.update(|c| c.gpu = gpu);
+                self.sync_filter();
                 self.save_setting("gpu", &gpu.to_string());
                 self.flash(if gpu { "GPU sampling on" } else { "GPU sampling off" }, false);
             }

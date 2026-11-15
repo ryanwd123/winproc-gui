@@ -193,7 +193,7 @@ impl Col {
                     format::duration_100ns(now_100ns.saturating_sub(p.create_time))
                 }
             }
-            Col::Path => p.info.path.as_deref().unwrap_or("").to_string(),
+            Col::Path => p.info.path().unwrap_or("").to_string(),
         }
     }
 
@@ -233,7 +233,7 @@ impl Col {
             Col::Priority => a.priority.cmp(&b.priority),
             // Newer processes have larger create times; "started" sorts by age.
             Col::Started => b.create_time.cmp(&a.create_time),
-            Col::Path => a.info.path.cmp(&b.info.path),
+            Col::Path => a.info.path().cmp(&b.info.path()),
         }
     }
 }

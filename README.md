@@ -19,6 +19,13 @@ cargo build --release
 
 The exe is `target\release\winproc-gui.exe`. It needs Windows 10 1607 or later.
 
+## Views
+
+Ctrl+Tab switches views, and the app remembers the last one.
+
+- **Main view:** the summary bar, the watch table and the all-processes table.
+- **Watch view:** only the search box and the watch table, using the whole window. In this view the sampler still reads the kernel's process list (one call returns all of them), but it builds rows and looks up paths only for watched processes. It skips the summary's system-wide reads and the GPU counters, unless the GPU % column is visible.
+
 ## Watch search
 
 | Search | Lists |
@@ -41,6 +48,7 @@ Press F1 in the app for the full list. Ctrl+Shift+P (or Ctrl+K) opens the comman
 | Keys | Action |
 |---|---|
 | Ctrl+F, `/` | focus the watch search |
+| Ctrl+Tab | switch between the main view and the watch view |
 | Tab / Shift+Tab | move between the search box, the watch table and the all-processes table |
 | Up, Down, PgUp, PgDn, Home, End | move the selection |
 | Delete | end the selected process (asks first) |

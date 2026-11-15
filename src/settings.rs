@@ -222,6 +222,8 @@ pub struct State {
     pub all_sort: SortState,
     /// Height of the watch table in DIPs at font size 13.
     pub watch_height: f32,
+    /// "main" or "watch".
+    pub view: String,
 }
 
 impl Default for State {
@@ -234,6 +236,7 @@ impl Default for State {
             watch_sort: SortState { col: Col::Name, desc: false },
             all_sort: SortState { col: Col::Cpu, desc: true },
             watch_height: 170.0,
+            view: "main".into(),
         }
     }
 }
@@ -261,6 +264,7 @@ impl State {
                         s.watch_height = h.clamp(40.0, 4000.0);
                     }
                 }
+                ("window", "view") => s.view = v.to_ascii_lowercase(),
                 ("watch", "search") => s.search = unescape(&v),
                 ("watch", k) if k.starts_with("history") => {
                     let v = unescape(&v);
@@ -287,7 +291,11 @@ impl State {
         if let Some((x, y, w, h)) = self.rect {
             let _ = write!(s, "x = {x}\r\ny = {y}\r\nwidth = {w}\r\nheight = {h}\r\n");
         }
-        let _ = write!(s, "maximized = {}\r\nwatch_height = {:.0}\r\n", self.maximized, self.watch_height);
+        let _ = write!(
+            s,
+            "maximized = {}\r\nwatch_height = {:.0}\r\nview = {}\r\n",
+            self.maximized, self.watch_height, self.view
+        );
         let _ = write!(s, "\r\n[watch]\r\nsearch = {}\r\n", escape(&self.search));
         for (i, h) in self.history.iter().enumerate() {
             let _ = write!(s, "history{i} = {}\r\n", escape(h));

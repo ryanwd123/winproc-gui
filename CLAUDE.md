@@ -1,25 +1,13 @@
 ## Project Info
 The Windows task manager is too slow for me and I can't customize it the way I like it. So I want to make my own that's better. 
 - Targeting Windows Only
-- use windows-rs crate
+### goals
 - minimal dependencies
 - small binary
 - instant startup
 - minimal idle cpu
 - low ram useage
-- custom directdraw/direct 2d UI
 - keyboard driven
-- Organize the keyboard shortcuts in the app so that they can be customized and to customize keyboard shortcuts we will use an INI file. In the command palette we will add a command to write key map INI which will write the full key map so the user can see all of the keys that they can change. 
-    - same idea for "write settings.ini"
-    - same idea for "write theme.ini"
-    - These commands will then open in the default text editor. 
-- initially include light/dark theme.
-- This app is going to be a lot simpler than the Windows Task Manager. 
-    - The inspiration is an app called winproc-tui (I saw that winproc-tui uses the winapi crate, can/should we use the windows-rs crate?)
-    - Across the tap show summary information that shows the overall CPU percentage, memory used and percentage, Ethernet, current Ethernet send and receive, and GPU percentage, etc.
-    - Below that, show the process list. By default, show the CPU percentage for each process as normalized for one core. Show the memory breakout for privil privileged bytes and thread handle GPU percentage I/O read. per second, I/O right per second.(same as winproc-tui, but add more if it is useful/availible and doesn't slow things down) 
-    - the app should remember its window size and position. 
-    - Where Winproc-tui has one section for the processes, I want to have two sections for the processes. The first section, there'll be a search input box above it where you can type in a search and it will list those processes in there and the app will remember that what you have in there if you close it and reopen it. The search should be on the process name and it should search for filter for each process that includes each search term in any order. and you can search for multiple processes by using this "|" operator. feel free to expand on the search input concept. The idea is I want to be able to easily filter for multiple programs that I am working on or want to monitor. Like one thing is sometimes Excel will open multiple processes, but so it will be easy for me to see that, and then I will have an easy way to kill that in the app. The second process section below that can be a nice scrollable table that lists all the processes and is sortable. 
 
 
 ## Repo Info
@@ -62,6 +50,9 @@ You can use this file as your long-term memory and also make changes to it for m
 - CPU % "per core" = 100% is one core (default, as the user asked); "total" = Task Manager style.
 - Ending processes: identified by (PID, create time) so a reused PID is never hit; critical system processes refused by name and `IsProcessCritical`. Confirmation dialog unless `confirm_kill = false`.
 - GPU counters cost ~0.7% of a core at a 1 s refresh (PDH `GPU Engine(*)` has ~1,000 instances). Possible future work: read GPU usage with D3DKMT directly.
+- Views (Ctrl+Tab, `View` in app.rs, saved as `view` in state.ini): Main and Watch. The Watch view has no summary bar or all-processes table. `App::sync_filter` sends the sampler a `Filter`, and then the sampler builds full rows (and resolves paths, lazily through `ProcInfo::path` OnceLock) only for watched processes. It skips per-core CPU, memory and network, and reads GPU counters only if the GPU column is shown. Counters are still updated for every process, so rates are right after a switch.
+- A search change or switch to the Watch view triggers a "peek" (`Shared::set_filter`): a rows-only rescan that reuses each process's last rates and the last totals, so the regular 1 s cadence and the graphs aren't disturbed. Switching back to Main triggers a full sample (watch samples have no summary values).
+- Idle CPU is dominated by the software Direct2D render target (~100 Mcycles/s at 1 redraw/s, a fixed cost per frame regardless of content). Hardware rendering is ~26–46 Mc/s but +78 ms startup and +20–35 MB private. See PERFORMANCE.md. Measure with cycles (`QueryProcessCycleTime`), not CPU time (15.6 ms ticks are too coarse).
 - Testing UI from a shell: launch with `$env:APPDATA` pointed at a scratch folder, drive with `WScript.Shell.SendKeys`, capture with `CopyFromScreen`. Ctrl+Shift+P via SendKeys didn't reach the app on this machine (Ctrl+K works), so palette tests use Ctrl+K.
 
 ## Ideas not done yet

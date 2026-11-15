@@ -7,7 +7,7 @@
 //! posted message.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Wdk::System::SystemInformation::{
@@ -28,11 +28,27 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{PCWSTR, PWSTR, w};
 
+use crate::search::{self, Query};
+
 /// What does not change while a process runs. Shared between snapshots.
 pub struct ProcInfo {
     pub name: Box<str>,
     pub name_lower: Box<str>,
-    pub path: Option<Box<str>>,
+    /// Looked up the first time the process is shown, so hidden processes cost nothing.
+    path: OnceLock<Option<Box<str>>>,
+}
+
+impl ProcInfo {
+    pub fn path(&self) -> Option<&str> {
+        self.path.get().and_then(|p| p.as_deref())
+    }
+}
+
+/// Limits a sample to the watched processes (the watch-only view).
+#[derive(Clone, PartialEq)]
+pub struct Filter {
+    pub query: Query,
+    pub children: bool,
 }
 
 #[derive(Clone)]
@@ -104,6 +120,11 @@ pub struct Snapshot {
     pub rates_valid: bool,
     /// How long the sample took.
     pub cost: Duration,
+    /// True when only the watched processes were included.
+    pub filtered: bool,
+    /// A quick rescan for a new search or view: rows are fresh, but CPU and I/O
+    /// rates and the system totals are the last regular sample's. Not a graph point.
+    pub peek: bool,
 }
 
 /// Settings the UI thread changes while the sampler runs.
@@ -113,6 +134,10 @@ pub struct Control {
     pub gpu: bool,
     pub quit: bool,
     pub wake: bool,
+    /// Only build rows for these processes; None for all of them.
+    pub filter: Option<Filter>,
+    /// Rescan the rows now without moving the regular sampling schedule.
+    pub peek: bool,
 }
 
 pub struct Shared {
@@ -127,6 +152,14 @@ impl Shared {
         let mut c = self.ctl.lock().unwrap();
         f(&mut c);
         c.wake = true;
+        self.cv.notify_one();
+    }
+
+    /// Changes which processes get rows, and rescans right away for them.
+    pub fn set_filter(&self, filter: Option<Filter>) {
+        let mut c = self.ctl.lock().unwrap();
+        c.filter = filter;
+        c.peek = true;
         self.cv.notify_one();
     }
 
@@ -155,30 +188,44 @@ pub fn start(hwnd: HWND, msg: u32, ctl: Control) -> Arc<Shared> {
 fn run(shared: Arc<Shared>, hwnd: isize, msg: u32) {
     let mut sampler = Sampler::new();
     let mut count = 0u32;
+    let mut due = Instant::now();
+    let post = |snap: Snapshot| {
+        *shared.latest.lock().unwrap() = Some(snap);
+        unsafe {
+            let _ = PostMessageW(Some(HWND(hwnd as _)), msg, WPARAM(0), LPARAM(0));
+        }
+    };
     loop {
-        let (paused, gpu, interval) = {
-            let c = shared.ctl.lock().unwrap();
+        let (paused, gpu, interval, filter, wake, peek) = {
+            let mut c = shared.ctl.lock().unwrap();
             if c.quit {
                 return;
             }
-            (c.paused, c.gpu, c.interval_ms)
+            let r = (c.paused, c.gpu, c.interval_ms, c.filter.clone(), c.wake, c.peek);
+            c.wake = false;
+            c.peek = false;
+            r
         };
+        let now = Instant::now();
         if !paused {
-            let snap = sampler.sample(gpu);
-            *shared.latest.lock().unwrap() = Some(snap);
-            unsafe {
-                let _ = PostMessageW(Some(HWND(hwnd as _)), msg, WPARAM(0), LPARAM(0));
+            if wake || now >= due {
+                post(sampler.sample(gpu, filter.as_ref()));
+                count += 1;
+                // The second sample comes quickly so CPU percentages show up right away.
+                let wait = if count == 1 { 250 } else { interval.max(100) };
+                due = now + Duration::from_millis(wait as u64);
+            } else if peek {
+                post(sampler.peek(filter.as_ref()));
             }
-            count += 1;
+        } else {
+            due = now;
         }
-        // The second sample comes quickly so CPU percentages show up right away.
-        let wait = if count == 1 { 250 } else { interval.max(100) };
         let c = shared.ctl.lock().unwrap();
-        let (mut c, _) = shared
+        let timeout = if paused { Duration::from_secs(3600) } else { due.saturating_duration_since(Instant::now()) };
+        let (c, _) = shared
             .cv
-            .wait_timeout_while(c, Duration::from_millis(wait as u64), |c| !c.wake && !c.quit)
+            .wait_timeout_while(c, timeout, |c| !c.wake && !c.peek && !c.quit)
             .unwrap();
-        c.wake = false;
         if c.quit {
             return;
         }
@@ -237,6 +284,17 @@ struct RawCpu {
     interrupt_count: u32,
 }
 
+/// One process from the first pass over the kernel's list.
+struct Light {
+    off: usize,
+    pid: u32,
+    ppid: u32,
+    create: u64,
+    cpu: f32,
+    io: (f64, f64, f64),
+    info: Arc<ProcInfo>,
+}
+
 struct Entry {
     info: Arc<ProcInfo>,
     cpu_time: u64,
@@ -244,12 +302,16 @@ struct Entry {
     write: u64,
     other: u64,
     seen: u32,
+    /// Rates from the last regular sample, reused by peeks.
+    cpu: f32,
+    io: (f64, f64, f64),
 }
 
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
 
 struct Sampler {
     buf: Vec<u64>,
+    light: Vec<Light>,
     known: HashMap<(u32, u64), Entry>,
     generation: u32,
     last: Option<Instant>,
@@ -258,6 +320,9 @@ struct Sampler {
     net_prev: HashMap<u64, (u64, u64)>,
     pdh: Option<Pdh>,
     pdh_tried: bool,
+    /// The last regular sample's totals and per-process GPU, reused by peeks.
+    last_sys: Sys,
+    last_gpu: HashMap<u32, f32>,
 }
 
 impl Sampler {
@@ -266,6 +331,7 @@ impl Sampler {
         unsafe { GetSystemInfo(&mut si) };
         Sampler {
             buf: vec![0; 64 * 1024],
+            light: Vec::new(),
             known: HashMap::new(),
             generation: 0,
             last: None,
@@ -274,10 +340,12 @@ impl Sampler {
             net_prev: HashMap::new(),
             pdh: None,
             pdh_tried: false,
+            last_sys: Sys::default(),
+            last_gpu: HashMap::new(),
         }
     }
 
-    fn sample(&mut self, gpu: bool) -> Snapshot {
+    fn sample(&mut self, gpu: bool, filter: Option<&Filter>) -> Snapshot {
         let t0 = Instant::now();
         let dt = self.last.map(|l| t0.duration_since(l).as_secs_f64()).unwrap_or(0.0);
         let rates_valid = dt > 0.0;
@@ -296,21 +364,26 @@ impl Sampler {
             None => (None, None, HashMap::new()),
         };
 
-        let mut procs = self.processes(dt, &gpu_procs);
-        procs.shrink_to_fit();
         let mut sys = Sys {
             ncpu: self.ncpu,
             disk,
             gpu: if gpu { gpu_sys } else { None },
             ..Default::default()
         };
-        self.cpu(&mut sys);
-        self.memory(&mut sys);
-        self.network(&mut sys, dt);
-        sys.procs = procs.len() as u32;
-        sys.threads = procs.iter().map(|p| p.threads).sum();
-        sys.handles = procs.iter().map(|p| p.handles).sum();
+        let procs = self.processes(dt, &gpu_procs, filter, &mut sys, true);
+        if filter.is_none() {
+            self.cpu(&mut sys);
+            self.memory(&mut sys);
+            self.network(&mut sys, dt);
+        } else {
+            // The watch view shows no summary. Forget the old counters so the
+            // first summary after switching back has no stale rates.
+            self.cpu_prev.clear();
+            self.net_prev.clear();
+        }
         sys.uptime_ms = unsafe { GetTickCount64() };
+        self.last_sys = sys.clone();
+        self.last_gpu = gpu_procs;
 
         let ft = unsafe { GetSystemTimeAsFileTime() };
         Snapshot {
@@ -319,10 +392,45 @@ impl Sampler {
             now_100ns: ft_u64(ft),
             rates_valid,
             cost: t0.elapsed(),
+            filtered: filter.is_some(),
+            peek: false,
         }
     }
 
-    fn processes(&mut self, dt: f64, gpu: &HashMap<u32, f32>) -> Vec<Proc> {
+    /// Rescans the process list for a new filter without touching the counters
+    /// that rates are computed from, so the regular samples stay evenly spaced.
+    fn peek(&mut self, filter: Option<&Filter>) -> Snapshot {
+        let t0 = Instant::now();
+        let mut sys = self.last_sys.clone();
+        sys.procs = 0;
+        sys.threads = 0;
+        sys.handles = 0;
+        let gpu = std::mem::take(&mut self.last_gpu);
+        let procs = self.processes(0.0, &gpu, filter, &mut sys, false);
+        self.last_gpu = gpu;
+        let ft = unsafe { GetSystemTimeAsFileTime() };
+        Snapshot {
+            procs,
+            sys,
+            now_100ns: ft_u64(ft),
+            rates_valid: true,
+            cost: t0.elapsed(),
+            filtered: filter.is_some(),
+            peek: true,
+        }
+    }
+
+    /// Every process (or only the watched ones), with rates since the last sample.
+    /// The totals in `sys` always cover every process. With `commit` false (a peek)
+    /// the stored counters are left alone and the last rates are reported.
+    fn processes(
+        &mut self,
+        dt: f64,
+        gpu: &HashMap<u32, f32>,
+        filter: Option<&Filter>,
+        sys: &mut Sys,
+        commit: bool,
+    ) -> Vec<Proc> {
         loop {
             let mut needed = 0u32;
             let bytes = (self.buf.len() * 8) as u32;
@@ -345,56 +453,54 @@ impl Sampler {
             }
             break;
         }
-        self.generation = self.generation.wrapping_add(1);
+        if commit {
+            self.generation = self.generation.wrapping_add(1);
+        }
         let generation = self.generation;
-        let mut out = Vec::with_capacity(512);
         let base = self.buf.as_ptr() as *const u8;
+        let raw = |off: usize| unsafe { &*(base.add(off) as *const RawProc) };
+
+        // Pass 1, cheap: update every process's counters, so rates stay right
+        // whichever processes are shown, and add up the totals.
+        self.light.clear();
         let mut off = 0usize;
         loop {
-            let p = unsafe { &*(base.add(off) as *const RawProc) };
+            let p = raw(off);
             let pid = p.unique_process_id as u32;
-            let create_time = p.create_time as u64;
+            let create = p.create_time as u64;
             let cpu_time = (p.user_time + p.kernel_time) as u64;
             let (read, write, other) = (
                 p.read_transfer_count as u64,
                 p.write_transfer_count as u64,
                 p.other_transfer_count as u64,
             );
-            let key = (pid, create_time);
-            let mut proc = Proc {
-                pid,
-                ppid: p.inherited_from_unique_process_id as u32,
-                create_time,
-                info: Arc::new(ProcInfo { name: "".into(), name_lower: "".into(), path: None }),
-                cpu: 0.0,
-                cpu_time,
-                private: p.private_page_count as u64,
-                ws: p.working_set_size as u64,
-                ws_private: p.working_set_private_size as u64,
-                threads: p.number_of_threads,
-                handles: p.handle_count,
-                gpu: gpu.get(&pid).copied().unwrap_or(0.0),
-                io_read: 0.0,
-                io_write: 0.0,
-                io_other: 0.0,
-                session: p.session_id,
-                priority: p.base_priority,
-            };
-            match self.known.get_mut(&key) {
+            sys.procs += 1;
+            sys.threads += p.number_of_threads;
+            sys.handles += p.handle_count;
+            let (mut cpu, mut io) = (0.0f32, (0.0, 0.0, 0.0));
+            let info = match self.known.get_mut(&(pid, create)) {
+                Some(e) if !commit => {
+                    cpu = e.cpu;
+                    io = e.io;
+                    e.info.clone()
+                }
                 Some(e) => {
                     if dt > 0.0 {
-                        let d = cpu_time.saturating_sub(e.cpu_time) as f64;
-                        proc.cpu = (d / (dt * 1e7) * 100.0) as f32;
-                        proc.io_read = read.saturating_sub(e.read) as f64 / dt;
-                        proc.io_write = write.saturating_sub(e.write) as f64 / dt;
-                        proc.io_other = other.saturating_sub(e.other) as f64 / dt;
+                        cpu = (cpu_time.saturating_sub(e.cpu_time) as f64 / (dt * 1e7) * 100.0) as f32;
+                        io = (
+                            read.saturating_sub(e.read) as f64 / dt,
+                            write.saturating_sub(e.write) as f64 / dt,
+                            other.saturating_sub(e.other) as f64 / dt,
+                        );
                     }
                     e.cpu_time = cpu_time;
                     e.read = read;
                     e.write = write;
                     e.other = other;
                     e.seen = generation;
-                    proc.info = e.info.clone();
+                    e.cpu = cpu;
+                    e.io = io;
+                    e.info.clone()
                 }
                 None => {
                     let name = if p.image_name_buf.is_null() || p.image_name_len == 0 {
@@ -408,22 +514,85 @@ impl Sampler {
                     let info = Arc::new(ProcInfo {
                         name_lower: name.to_lowercase().into(),
                         name: name.into(),
-                        path: image_path(pid),
+                        path: OnceLock::new(),
                     });
-                    proc.info = info.clone();
-                    self.known.insert(
-                        key,
-                        Entry { info, cpu_time, read, write, other, seen: generation },
-                    );
+                    // A peek leaves new processes for the next regular sample to count.
+                    if commit {
+                        self.known.insert(
+                            (pid, create),
+                            Entry {
+                                info: info.clone(),
+                                cpu_time,
+                                read,
+                                write,
+                                other,
+                                seen: generation,
+                                cpu: 0.0,
+                                io: (0.0, 0.0, 0.0),
+                            },
+                        );
+                    }
+                    info
                 }
-            }
-            out.push(proc);
+            };
+            self.light.push(Light {
+                off,
+                pid,
+                ppid: p.inherited_from_unique_process_id as u32,
+                create,
+                cpu,
+                io,
+                info,
+            });
             if p.next_entry_offset == 0 {
                 break;
             }
             off += p.next_entry_offset as usize;
         }
-        self.known.retain(|_, e| e.seen == generation);
+        if commit {
+            self.known.retain(|_, e| e.seen == generation);
+        }
+
+        // Which processes get a full row.
+        let keep: Option<Vec<bool>> = filter.map(|f| {
+            let mut hit: Vec<bool> =
+                self.light.iter().map(|l| f.query.matches(&l.info.name_lower, l.pid)).collect();
+            if f.children {
+                let tree: Vec<(u32, u32, u64)> = self.light.iter().map(|l| (l.pid, l.ppid, l.create)).collect();
+                search::add_children(&tree, &mut hit);
+            }
+            hit
+        });
+
+        // Pass 2: full rows, and executable paths only for processes that are shown.
+        let n = keep.as_ref().map(|k| k.iter().filter(|&&b| b).count()).unwrap_or(self.light.len());
+        let mut out = Vec::with_capacity(n);
+        for (i, l) in self.light.iter().enumerate() {
+            if keep.as_ref().is_some_and(|k| !k[i]) {
+                continue;
+            }
+            let p = raw(l.off);
+            l.info.path.get_or_init(|| image_path(l.pid));
+            out.push(Proc {
+                pid: l.pid,
+                ppid: l.ppid,
+                create_time: l.create,
+                info: l.info.clone(),
+                cpu: l.cpu,
+                cpu_time: (p.user_time + p.kernel_time) as u64,
+                private: p.private_page_count as u64,
+                ws: p.working_set_size as u64,
+                ws_private: p.working_set_private_size as u64,
+                threads: p.number_of_threads,
+                handles: p.handle_count,
+                gpu: gpu.get(&l.pid).copied().unwrap_or(0.0),
+                io_read: l.io.0,
+                io_write: l.io.1,
+                io_other: l.io.2,
+                session: p.session_id,
+                priority: p.base_priority,
+            });
+        }
         out
     }
 

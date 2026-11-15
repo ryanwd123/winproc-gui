@@ -17,6 +17,8 @@ pub enum Action {
     FocusSearch,
     ClearSearch,
     NextPane,
+    NextView,
+    PrevView,
     PrevPane,
     FocusWatch,
     FocusAll,
@@ -98,6 +100,8 @@ pub fn bindings() -> Vec<Binding> {
     let g = "Moving around";
     add(g, "focus_search", "Focus the watch search box", FocusSearch, "Ctrl+F, Ctrl+L, /");
     add(g, "clear_search", "Clear the watch search", ClearSearch, "");
+    add(g, "next_view", "Next view (main / watch only)", NextView, "Ctrl+Tab");
+    add(g, "prev_view", "Previous view", PrevView, "Ctrl+Shift+Tab");
     add(g, "next_pane", "Next area", NextPane, "Tab");
     add(g, "prev_pane", "Previous area", PrevPane, "Shift+Tab");
     add(g, "focus_watch", "Focus the watch table", FocusWatch, "Alt+1");
