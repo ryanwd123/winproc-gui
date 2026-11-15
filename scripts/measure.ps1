@@ -4,7 +4,7 @@
 #
 # Idle CPU is measured three ways: main view with GPU sampling on (the default), main view
 # with it off, and the watch view watching "svchost" (default columns, so GPU is still read
-# for the GPU % column). It is counted in CPU cycles (QueryProcessCycleTime), which is exact;
+# for the GPU % column), plus the temperatures view. It is counted in CPU cycles (QueryProcessCycleTime), which is exact;
 # Windows' CPU *time* only moves in 15.6 ms ticks and is too coarse at this level.
 param(
     [string]$Exe = "$PSScriptRoot\..\target\release\winproc-gui.exe",
@@ -67,11 +67,13 @@ for ($i = 0; $i -lt $Runs; $i++) {
 $on = Measure-Idle $true "main"
 $off = Measure-Idle $false "main"
 $watch = Measure-Idle $true "watch"
+$temps = Measure-Idle $true "temps"
 $s = $times | Sort-Object
 "Binary size:          {0:N0} bytes" -f (Get-Item $Exe).Length
 "Startup (ms):         median {0:N1}, min {1:N1}, max {2:N1} over $Runs runs" -f $s[[int]($Runs / 2)], $s[0], $s[-1]
 "Idle CPU, GPU on:     {0:N1} Mcycles/s" -f $on.Mcps
 "Idle CPU, GPU off:    {0:N1} Mcycles/s" -f $off.Mcps
 "Idle CPU, watch view: {0:N1} Mcycles/s" -f $watch.Mcps
+"Idle CPU, temps view: {0:N1} Mcycles/s, private {1:N1} MB, working set {2:N1} MB" -f $temps.Mcps, $temps.Private, $temps.WorkingSet
 "Memory (MB):          private {0:N1}, working set {1:N1} (GPU on)" -f $on.Private, $on.WorkingSet
 "Threads:              $($on.Threads), handles: $($on.Handles)"
