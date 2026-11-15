@@ -2,7 +2,7 @@
 
 A fast, keyboard-driven process monitor for Windows. It is meant to start instantly, use almost no CPU when idle, and make it easy to watch and end the handful of programs you care about.
 
-- **Summary tiles:** CPU (with per-core bars), memory and commit, disk active time and throughput, network send and receive, GPU, and process, thread and handle counts. Each tile has a history graph.
+- **Summary tiles:** CPU (with per-core bars), memory and commit, disk active time and throughput, network send and receive, GPU, and process, thread and handle counts. Each tile has a history graph. Alt+S switches to a compact, text-only summary line.
 - **Watch table:** type `excel | code | python` and only those processes are listed, with a totals row. The search is remembered between runs. Press Ctrl+Shift+K to end everything the watch table lists, for example all of Excel's leftover processes.
 - **All-processes table:** every process, sortable by any column.
 - **Columns:** name, PID, CPU % (per core or whole machine), private bytes, working set, threads, handles, GPU %, I/O read/s and write/s. You can also add parent PID, CPU time, private working set, other I/O, session, priority, age and path.
@@ -50,6 +50,7 @@ Press F1 in the app for the full list. Ctrl+Shift+P (or Ctrl+K) opens the comman
 | Ctrl+1 … Ctrl+9 | sort by a column; press again to reverse |
 | Alt+C | CPU %: per core or whole machine |
 | Ctrl+T | dark / light theme |
+| Alt+S | compact summary: one line of text, no graphs |
 | Ctrl+= / Ctrl+- / Ctrl+0 | font size |
 | Ctrl+E | open the file location |
 | Ctrl+C / Ctrl+Shift+C | copy name, PID and path / copy the path |

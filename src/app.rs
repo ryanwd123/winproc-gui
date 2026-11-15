@@ -520,6 +520,7 @@ impl App {
         }
         self.update_paused();
         self.rebuild();
+        self.compute_layout();
         self.invalidate();
     }
 
@@ -605,7 +606,8 @@ impl App {
         let mut l = Layout { pad, row_h, header_h, sb_w: (s * 0.75).round(), ..Default::default() };
         let inner = w - 2.0 * pad;
         let mut y = pad;
-        l.tiles = Rect::new(pad, y, inner, (s * 5.4).round());
+        let tiles_h = if self.settings.compact_summary { (s * 2.1).round() } else { (s * 5.4).round() };
+        l.tiles = Rect::new(pad, y, inner, tiles_h);
         y += l.tiles.h + pad;
         l.search = Rect::new(pad, y, inner, (s * 2.1).round());
         y += l.search.h + pad * 0.5;
@@ -678,7 +680,61 @@ impl App {
         self.gfx = Some(g);
     }
 
+    /// The text-only summary: one row of label/value cells, no graphs.
+    fn paint_compact(&self, g: &mut Gfx) {
+        let t = &self.theme;
+        let r = self.layout.tiles;
+        g.fill_round(r, 6.0, t.panel);
+        let Some(snap) = &self.snap else { return };
+        let s = &snap.sys;
+        let gb = |b: u64| format!("{:.1}", b as f64 / (1024.0 * 1024.0 * 1024.0));
+        let used = s.mem_total.saturating_sub(s.mem_avail);
+        let mem_pct = if s.mem_total > 0 { used as f32 / s.mem_total as f32 * 100.0 } else { 0.0 };
+        let disk = match &s.disk {
+            Some(d) => format!("{:.0}%   R {}   W {}", d.active, format::rate(d.read), format::rate(d.write)),
+            None => "–".into(),
+        };
+        let gpu = match (self.settings.gpu, s.gpu) {
+            (false, _) => "off".to_string(),
+            (true, Some(v)) => format!("{v:.0}%"),
+            (true, None) => "–".to_string(),
+        };
+        let cells: [(&str, String, f32); 6] = [
+            ("CPU", format!("{:.0}%", s.cpu), 0.75),
+            ("Memory", format!("{mem_pct:.0}%   {} / {} GB", gb(used), gb(s.mem_total)), 1.5),
+            ("Disk", disk, 1.55),
+            ("Net", format!("↓ {}   ↑ {}", format::rate(s.net.recv), format::rate(s.net.send)), 1.55),
+            ("GPU", gpu, 0.7),
+            (
+                "Procs",
+                format!(
+                    "{}   {} threads   up {}",
+                    format::count(s.procs as u64),
+                    format::count(s.threads as u64),
+                    format::duration_100ns(s.uptime_ms * 10_000)
+                ),
+                1.75,
+            ),
+        ];
+        let total: f32 = cells.iter().map(|c| c.2).sum();
+        let mut x = r.x;
+        for (i, (label, value, w)) in cells.iter().enumerate() {
+            let cw = r.w * w / total;
+            if i > 0 {
+                g.vline(x, r.y + 6.0, r.bottom() - 6.0, t.border);
+            }
+            let inner = Rect::new(x + 10.0, r.y, cw - 16.0, r.h);
+            let lw = g.measure(label, Font::Small) + 8.0;
+            g.text(label, Rect::new(inner.x, r.y, lw, r.h), Font::Small, t.text_dim, Align::Left);
+            g.text(value, Rect::new(inner.x + lw, r.y, inner.w - lw, r.h), Font::Bold, t.text, Align::Left);
+            x += cw;
+        }
+    }
+
     fn paint_tiles(&self, g: &mut Gfx) {
+        if self.settings.compact_summary {
+            return self.paint_compact(g);
+        }
         let t = &self.theme;
         let l = &self.layout;
         let r = l.tiles;
@@ -1694,6 +1750,11 @@ impl App {
                 self.shared.update(|c| c.gpu = gpu);
                 self.save_setting("gpu", &gpu.to_string());
                 self.flash(if gpu { "GPU sampling on" } else { "GPU sampling off" }, false);
+            }
+            ToggleCompact => {
+                self.settings.compact_summary = !self.settings.compact_summary;
+                let v = self.settings.compact_summary.to_string();
+                self.save_setting("compact_summary", &v);
             }
             ToggleHeat => {
                 self.settings.heat_bars = !self.settings.heat_bars;

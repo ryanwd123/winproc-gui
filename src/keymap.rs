@@ -50,6 +50,7 @@ pub enum Action {
     AlwaysOnTop,
     ToggleGpu,
     ToggleHeat,
+    ToggleCompact,
     RestartAdmin,
     WriteKeymap,
     WriteSettings,
@@ -132,6 +133,7 @@ pub fn bindings() -> Vec<Binding> {
     add(g, "refresh_slower", "Update slower", Slower, "Ctrl+Shift+Down");
     add(g, "toggle_gpu", "Toggle GPU sampling", ToggleGpu, "");
     add(g, "toggle_heat", "Toggle CPU / GPU bars", ToggleHeat, "");
+    add(g, "toggle_compact", "Toggle compact summary (text only, no graphs)", ToggleCompact, "Alt+S");
 
     let g = "Sorting";
     let sort_keys: HashMap<Col, String> = columns::DEFAULT

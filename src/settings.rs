@@ -40,6 +40,7 @@ pub struct Settings {
     pub pause_when_minimized: bool,
     pub show_idle: bool,
     pub heat_bars: bool,
+    pub compact_summary: bool,
     pub hardware_rendering: bool,
     pub history: usize,
 }
@@ -62,6 +63,7 @@ impl Default for Settings {
             pause_when_minimized: true,
             show_idle: false,
             heat_bars: true,
+            compact_summary: false,
             hardware_rendering: false,
             history: 60,
         }
@@ -115,6 +117,7 @@ impl Settings {
             "pause_when_minimized" => self.pause_when_minimized = b.unwrap_or(self.pause_when_minimized),
             "show_idle" => self.show_idle = b.unwrap_or(self.show_idle),
             "heat_bars" => self.heat_bars = b.unwrap_or(self.heat_bars),
+            "compact_summary" => self.compact_summary = b.unwrap_or(self.compact_summary),
             "hardware_rendering" => self.hardware_rendering = b.unwrap_or(self.hardware_rendering),
             "history" => {
                 if let Ok(n) = v.parse::<usize>() {
@@ -182,6 +185,11 @@ impl Settings {
         put("Stop sampling while the window is minimized.", "pause_when_minimized", yn(self.pause_when_minimized));
         put("List the System Idle Process.", "show_idle", yn(self.show_idle));
         put("Draw bars behind CPU and GPU values in the tables.", "heat_bars", yn(self.heat_bars));
+        put(
+            "Show the summary as one line of text, without graphs (Alt+S toggles).",
+            "compact_summary",
+            yn(self.compact_summary),
+        );
         put(
             "Draw with the GPU instead of the CPU. Software drawing starts faster and\nuses less memory; hardware drawing can be smoother on very large windows.\nTakes effect on restart.",
             "hardware_rendering",
