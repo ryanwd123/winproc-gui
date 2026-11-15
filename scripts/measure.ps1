@@ -1,12 +1,24 @@
 # Measures a release build for PERFORMANCE.md: size, startup time, memory and idle CPU.
 # Usage: pwsh scripts/measure.ps1 [-Exe path\to\winproc-gui.exe] [-Runs 7] [-IdleSeconds 20]
 # Settings go to a throwaway APPDATA so your real settings and window position are not touched.
-# Idle CPU is measured twice: with GPU sampling on (the default) and off.
+#
+# Idle CPU is measured three ways: main view with GPU sampling on (the default), main view
+# with it off, and the watch view watching "svchost" (default columns, so GPU is still read
+# for the GPU % column). It is counted in CPU cycles (QueryProcessCycleTime), which is exact;
+# Windows' CPU *time* only moves in 15.6 ms ticks and is too coarse at this level.
 param(
     [string]$Exe = "$PSScriptRoot\..\target\release\winproc-gui.exe",
     [int]$Runs = 7,
     [int]$IdleSeconds = 20
 )
+
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public static class Cycles {
+    [DllImport("kernel32.dll")] public static extern bool QueryProcessCycleTime(IntPtr h, out ulong c);
+    public static ulong Of(IntPtr h) { ulong c; QueryProcessCycleTime(h, out c); return c; }
+}
+"@
 
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "winproc-gui-measure"
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
@@ -20,18 +32,18 @@ function Stop-App($p) {
     if (!$p.HasExited) { $p.Kill() }
 }
 
-function Measure-Idle([bool]$gpu) {
+function Measure-Idle([bool]$gpu, [string]$view) {
     Set-Content $ini "[settings]`r`ngpu = $($gpu.ToString().ToLower())`r`n"
+    Set-Content "$tmp\winproc-gui\state.ini" "[window]`r`nview = $view`r`n[watch]`r`nsearch = svchost`r`n"
     $p = Start-Process $Exe -PassThru
     $null = $p.WaitForInputIdle(10000)
     Start-Sleep 5
-    $p.Refresh()
-    $cpu0 = $p.TotalProcessorTime
+    $c0 = [Cycles]::Of($p.Handle)
     Start-Sleep $IdleSeconds
+    $c = [Cycles]::Of($p.Handle) - $c0
     $p.Refresh()
-    $cpu = ($p.TotalProcessorTime - $cpu0).TotalMilliseconds
     $r = [pscustomobject]@{
-        Cpu = $cpu; Private = $p.PrivateMemorySize64 / 1MB; WorkingSet = $p.WorkingSet64 / 1MB
+        Mcps = $c / 1e6 / $IdleSeconds; Private = $p.PrivateMemorySize64 / 1MB; WorkingSet = $p.WorkingSet64 / 1MB
         Threads = $p.Threads.Count; Handles = $p.HandleCount
     }
     Stop-App $p
@@ -52,13 +64,14 @@ for ($i = 0; $i -lt $Runs; $i++) {
     Stop-App $p
 }
 
-$on = Measure-Idle $true
-$off = Measure-Idle $false
+$on = Measure-Idle $true "main"
+$off = Measure-Idle $false "main"
+$watch = Measure-Idle $true "watch"
 $s = $times | Sort-Object
-$pct = { param($ms) 100 * $ms / ($IdleSeconds * 1000) }
-"Binary size:     {0:N0} bytes" -f (Get-Item $Exe).Length
-"Startup (ms):    median {0:N1}, min {1:N1}, max {2:N1} over $Runs runs" -f $s[[int]($Runs / 2)], $s[0], $s[-1]
-"Idle CPU, GPU on:  {0:N0} ms over $IdleSeconds s ({1:N2}% of one core)" -f $on.Cpu, (& $pct $on.Cpu)
-"Idle CPU, GPU off: {0:N0} ms over $IdleSeconds s ({1:N2}% of one core)" -f $off.Cpu, (& $pct $off.Cpu)
-"Memory (MB):     private {0:N1}, working set {1:N1} (GPU on)" -f $on.Private, $on.WorkingSet
-"Threads:         $($on.Threads), handles: $($on.Handles)"
+"Binary size:          {0:N0} bytes" -f (Get-Item $Exe).Length
+"Startup (ms):         median {0:N1}, min {1:N1}, max {2:N1} over $Runs runs" -f $s[[int]($Runs / 2)], $s[0], $s[-1]
+"Idle CPU, GPU on:     {0:N1} Mcycles/s" -f $on.Mcps
+"Idle CPU, GPU off:    {0:N1} Mcycles/s" -f $off.Mcps
+"Idle CPU, watch view: {0:N1} Mcycles/s" -f $watch.Mcps
+"Memory (MB):          private {0:N1}, working set {1:N1} (GPU on)" -f $on.Private, $on.WorkingSet
+"Threads:              $($on.Threads), handles: $($on.Handles)"

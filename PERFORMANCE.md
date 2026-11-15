@@ -4,15 +4,22 @@ One row per measured change, so we can see what each change costs. Measured on t
 release build with `pwsh scripts/measure.ps1`, which uses a throwaway settings folder.
 
 - **Startup:** process launch until the main window exists. Median of 7 runs (min–max). The first run is usually a cold start.
-- **Idle CPU:** CPU time used during 20 s with the window open and the default 1 s refresh, as % of one core. Windows counts CPU time in 15.6 ms ticks, so "0" means less than one tick.
-- **Private / Working set:** memory after about 25 s, with GPU sampling on.
-- **Sample:** the in-app "sample N ms" figure (one NtQuerySystemInformation pass plus PDH, network and memory), read from the bar above the all-processes table.
+- **Idle CPU:** CPU cycles per second (`QueryProcessCycleTime`) over 20 s with the window open at 1 s refresh. Measured three ways: main view with GPU sampling on (the default), main view with it off, and the watch view watching "svchost". At about 5 GHz, 100 Mcycles/s is about 2% of one core. Runs vary by roughly ±30%, so only bigger differences mean anything.
+- **Private / Working set:** memory about 25 s after startup, main view, GPU sampling on.
 
-Machine: Intel i7-13700K (24 logical), 64 GB RAM, RTX 3090 + UHD 770, Windows 11 Pro 22631, about 260 processes.
+Machine: Intel i7-13700K (24 logical), 64 GB RAM, RTX 3090 + UHD 770, Windows 11 Pro 22631, about 260 processes. Window 1300×780.
 
-| Version | Date | Commit | Binary size | Startup (median, min–max) | Idle CPU, GPU on | Idle CPU, GPU off | Private | Working set | Threads | Handles | Sample |
-|---------|------|--------|-------------|---------------------------|------------------|-------------------|---------|-------------|---------|---------|--------|
-| 0.1.0 | 2026-11-15 | `2464124` | 412,672 B (403 KiB) | 57.9 ms (47.4–119.6) | 141 ms / 20 s (0.70%) | 0 ms / 20 s (0.00%) | 39.1 MB | 48.4 MB | 41 | 300 | 5–10 ms |
+| Version | Date | Commit | Binary size | Startup (median, min–max) | Idle, GPU on | Idle, GPU off | Idle, watch view | Private | Working set | Threads | Handles |
+|---------|------|--------|-------------|---------------------------|--------------|---------------|------------------|---------|-------------|---------|---------|
+| 0.1.0 | 2026-11-15 | `2464124` | 412,672 B (403 KiB) | 57.9 ms (47.4–119.6) | 141 ms CPU / 20 s* | 0 ms CPU / 20 s* | – | 39.1 MB | 48.4 MB | 41 | 300 |
+| 0.1.0 | 2026-11-15 | views | 424,448 B (414 KiB) | 55.2 ms (41.9–102.9) | 95 Mc/s | 106 Mc/s | 102 Mc/s | 28.2 MB | 37.8 MB | 22 | 301 |
 
-Notes:
-- 0.1.0: almost all idle CPU comes from the PDH `GPU Engine(*)` counter, which has about 1,000 instances. PDH also starts its own threads (41 threads with GPU on, about 20 with it off). Reading GPU usage through D3DKMT directly, like System Informer does, is the obvious next step if this matters.
+\* The first row measured CPU *time*, which Windows counts in 15.6 ms ticks. That turned out to be far too coarse: the same build gave anywhere from 31 to 203 ms. Later rows count cycles.
+
+## Findings
+
+- **Drawing dominates idle CPU, not sampling.** With updates paused (F9) the app uses 0.2 Mc/s. Per thread: the UI thread uses about 20 Mc/s, the sampler about 19 Mc/s (one NtQuerySystemInformation pass, about 3–5 ms), and the rest is spread over the software renderer's worker threads at about 5 Mc/s each.
+- **The software Direct2D render target costs about 100 Mc/s at 1 redraw per second; hardware costs about 26–46 Mc/s.** How much is drawn hardly matters: full tiles with CPU/GPU bars, the compact summary with no bars, and the watch view all measured within the noise of each other. Grayscale text instead of ClearType made no difference either. The software path seems to have a fixed cost per frame for the window size.
+- **Hardware rendering costs about 78 ms more startup (47 → 125 ms) and about 20–35 MB more private memory.** That is the trade-off behind the `hardware_rendering` setting.
+- **GPU counters:** in the first measurement they looked like most of the idle cost. With cycle counts, GPU on and off are within the noise of each other at this refresh rate. They do add about 20 threads, which PDH starts. The watch view skips them unless the GPU % column is visible.
+- **The watch view** skips per-process rows, paths and the system-wide reads (per-core CPU, memory, network) for unwatched processes. Sampling was never the big cost, so its idle CPU looks like the main view's; drawing dominates both.
