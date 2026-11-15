@@ -80,7 +80,7 @@ Commands that change a setting (theme, font size, columns and so on) update only
 - One `NtQuerySystemInformation(SystemProcessInformation)` call per refresh returns every process's times, memory, handle, thread and I/O counters. A sample takes about 5 ms on a machine with 270 processes, and it runs on a background thread.
 - Per-core CPU comes from `SystemProcessorPerformanceInformation`, memory from `GlobalMemoryStatusEx` and `GetPerformanceInfo`, and network from `GetIfTable2`.
 - Disk and GPU come from PDH counters (`PhysicalDisk(_Total)` and `GPU Engine(*)`). The GPU counters are what Task Manager reads too, and they cost most of the app's idle CPU. Set `gpu = false` to turn them off.
-- Drawing uses a software Direct2D render target: it starts faster and uses less memory than the GPU path for a window that redraws once a second. Set `hardware_rendering = true` to use the GPU instead.
+- Drawing uses a hardware Direct2D render target. Redrawing once a second costs about a third of the CPU that software drawing does, which is most of the app's idle cost. Set `hardware_rendering = false` to draw in software instead: startup is about 80 ms faster and it uses about 20–35 MB less memory.
 - Sampling stops while the window is minimized.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for measurements.

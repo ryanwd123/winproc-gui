@@ -64,7 +64,7 @@ impl Default for Settings {
             show_idle: false,
             heat_bars: true,
             compact_summary: false,
-            hardware_rendering: false,
+            hardware_rendering: true,
             history: 60,
         }
     }
@@ -191,7 +191,7 @@ impl Settings {
             yn(self.compact_summary),
         );
         put(
-            "Draw with the GPU instead of the CPU. Software drawing starts faster and\nuses less memory; hardware drawing can be smoother on very large windows.\nTakes effect on restart.",
+            "Draw with the GPU. Uses about a third of the idle CPU of software drawing,\nbut starts about 80 ms slower and uses about 20-35 MB more memory. Set to\nfalse for software drawing. Windows falls back to software drawing on its\nown when no GPU is available. Takes effect on restart.",
             "hardware_rendering",
             yn(self.hardware_rendering),
         );

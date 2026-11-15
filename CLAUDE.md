@@ -39,7 +39,7 @@ You can use this file as your long-term memory and also make changes to it for m
 - Layout of `src/`:
   - `main.rs` window class, wndproc, message loop, placement restore.
   - `app.rs` all UI state, layout, painting, keys, mouse and commands (`run(Action)`).
-  - `render.rs` thin Direct2D/DirectWrite wrapper (`Gfx`); everything is in DIPs. Software render target by default (faster startup, less RAM); `hardware_rendering` setting switches.
+  - `render.rs` thin Direct2D/DirectWrite wrapper (`Gfx`); everything is in DIPs. Hardware render target by default (user's choice, 2026-11-15: lower idle CPU over faster startup and lower RAM); `hardware_rendering = false` switches to software.
   - `sampler.rs` background thread: one `NtQuerySystemInformation(SystemProcessInformation)` per tick (custom `RawProc` struct with the full layout), per-core CPU, memory, `GetIfTable2` network, PDH disk + `GPU Engine(*)`. Posts `WM_APP_SNAPSHOT`. PDH is set up after the first sample to keep startup fast. Sampling pauses while minimized.
   - `search.rs` watch-search language (`|`, words in any order, `!`/`-` exclude, `=exact`, `^prefix`, `pid:N`, quotes). Unit-tested.
   - `keymap.rs` every action: group, INI name, palette title, default keys. Palette, help overlay and keymap.ini are all generated from `bindings()`; add new commands there.
